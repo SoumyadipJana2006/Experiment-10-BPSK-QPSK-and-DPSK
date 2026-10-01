@@ -1,2 +1,685 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# ==============================================================================
+# Experiment 10 — BPSK, QPSK and DPSK (DBPSK)
+# Digital Communication Laboratory
+#
+# Objectives:
+# 1. Implement normalized BPSK, Gray-coded QPSK, and DBPSK modulators/demodulators.
+# 2. Study phase ambiguity and constellation rotation under carrier phase offsets:
+#    (0°, 10°, 30°, 60°, 90°).
+# 3. Generate Required Visualizations:
+#    - Ideal and Noisy Constellations (BPSK, QPSK, DBPSK)
+#    - Detailed Gray-coded QPSK Mapping Diagram
+#    - Phase Trajectory and I/Q State Transitions
+#    - BER Comparison (Simulated vs Theoretical Curves & vs Phase Offset)
+#    - Decision Statistic Histograms with Decision Boundaries
+# 4. Validate QPSK mapping (00, 01, 11, 10) and differential decoding properties.
+#
+# Required libraries:
+#       numpy, matplotlib, math
+# ==============================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+# Vectorized complementary error function for theoretical BER calculation
+erfc_vec = np.vectorize(math.erfc)
+
+
+# ==============================================================================
+# USER PARAMETERS & CONFIGURATION
+# ==============================================================================
+
+NUM_BITS = 200000            # Number of bits for high-accuracy BER simulation
+DISPLAY_SYMBOLS = 1500       # Symbols displayed in scatter/constellation plots
+SNR_FOR_PLOTS = 8            # Eb/N0 in dB for constellation and trajectory plots
+PHASE_OFFSETS = [0, 10, 30, 60, 90]  # Carrier phase offsets to investigate
+
+# Eb/N0 range in dB for BER simulation
+EBN0_DB = np.arange(0, 13, 2)
+
+# High-resolution Eb/N0 range for smooth theoretical curves
+EBN0_DB_FINE = np.linspace(0, 12, 200)
+
+# Set random seed for repeatable results
+np.random.seed(42)
+
+
+# ==============================================================================
+# 1. BPSK MODULATION AND DEMODULATION
+# ==============================================================================
+
+def bpsk_mapper(bits):
+    """
+    BPSK Mapper:
+        bit 0 -> +1 + 0j (Phase 0°)
+        bit 1 -> -1 + 0j (Phase 180°)
+    Normalized average symbol energy Es = 1, Eb = 1.
+    """
+    bits = np.asarray(bits)
+    symbols = 1 - 2 * bits
+    return symbols.astype(complex)
+
+
+def bpsk_demapper(received):
+    """
+    Coherent BPSK Demapper:
+        Decision boundary at Re(r) = 0:
+            Re(r) >= 0 -> bit 0
+            Re(r) <  0 -> bit 1
+    """
+    return (received.real < 0).astype(int)
+
+
+# ==============================================================================
+# 2. GRAY-CODED QPSK MODULATION AND DEMODULATION
+# ==============================================================================
+
+def qpsk_mapper(bits):
+    """
+    Gray-coded QPSK Mapper:
+        Bit Pair (b1, b2) -> In-Phase (I), Quadrature (Q) -> Phase
+        ----------------------------------------------------------
+             00           ->   +1/√2,   +1/√2            ->   45°
+             01           ->   -1/√2,   +1/√2            ->  135°
+             11           ->   -1/√2,   -1/√2            ->  225°
+             10           ->   +1/√2,   -1/√2            ->  315°
+    
+    Energy normalization: |symbol| = 1, Es = 1, Eb = Es / 2 = 0.5.
+    """
+    bits = np.asarray(bits)
+    if len(bits) % 2 != 0:
+        bits = bits[:-1]
+
+    bit_pairs = bits.reshape(-1, 2)
+    b1 = bit_pairs[:, 0]
+    b2 = bit_pairs[:, 1]
+
+    # I mapping: 0 -> +1 for b2=0, -1 for b2=1
+    # Q mapping: 0 -> +1 for b1=0, -1 for b1=1
+    I = np.where(b2 == 0, 1.0, -1.0)
+    Q = np.where(b1 == 0, 1.0, -1.0)
+
+    symbols = (I + 1j * Q) / np.sqrt(2)
+    return symbols
+
+
+def qpsk_demapper(received):
+    """
+    Vectorized Coherent Gray-coded QPSK Demapper:
+        I >= 0, Q >= 0 -> (0, 0)
+        I <  0, Q >= 0 -> (0, 1)
+        I <  0, Q <  0 -> (1, 1)
+        I >= 0, Q <  0 -> (1, 0)
+    """
+    b1 = (received.imag < 0).astype(int)
+    b2 = (received.real < 0).astype(int)
+    return np.column_stack((b1, b2)).reshape(-1)
+
+
+# ==============================================================================
+# 3. DBPSK (DIFFERENTIAL BPSK) MODULATION AND DEMODULATION
+# ==============================================================================
+
+def dbpsk_mapper(bits):
+    """
+    Differential BPSK (DBPSK) Mapper:
+        bit 0 -> No phase transition   (s[k] =  s[k-1])
+        bit 1 -> 180° phase transition (s[k] = -s[k-1])
+    A known reference symbol s[0] = +1 is transmitted first.
+    """
+    bits = np.asarray(bits)
+    symbols = np.zeros(len(bits) + 1, dtype=complex)
+    symbols[0] = 1.0 + 0j  # Reference symbol
+
+    for k, bit in enumerate(bits):
+        if bit == 0:
+            symbols[k + 1] = symbols[k]
+        else:
+            symbols[k + 1] = -symbols[k]
+
+    return symbols
+
+
+def dbpsk_demapper(received):
+    """
+    Non-coherent Differential BPSK Demapper:
+        Decision statistic: z[k] = r[k] * conj(r[k-1])
+        Decision boundary:
+            Re(z[k]) >= 0 -> bit 0
+            Re(z[k]) <  0 -> bit 1
+    """
+    z = received[1:] * np.conj(received[:-1])
+    detected_bits = (z.real < 0).astype(int)
+    return detected_bits, z.real
+
+
+# ==============================================================================
+# 4. CHANNEL IMPAIRMENTS: PHASE OFFSET & AWGN
+# ==============================================================================
+
+def apply_phase_offset(symbols, phase_deg):
+    """
+    Introduces a carrier phase offset: r = s * exp(j * phi)
+    """
+    phi = np.deg2rad(phase_deg)
+    return symbols * np.exp(1j * phi)
+
+
+def add_awgn(symbols, ebn0_db, bits_per_symbol):
+    """
+    Adds complex Additive White Gaussian Noise (AWGN) given Eb/N0 (dB).
+    Es = Mean symbol energy
+    Eb = Es / bits_per_symbol
+    N0 = Eb / (10^(Eb/N0_dB / 10))
+    Noise variance per dimension sigma^2 = N0 / 2
+    """
+    Es = np.mean(np.abs(symbols) ** 2)
+    Eb = Es / bits_per_symbol
+    ebn0_lin = 10 ** (ebn0_db / 10)
+    N0 = Eb / ebn0_lin
+    noise_std = np.sqrt(N0 / 2)
+
+    noise = noise_std * (
+        np.random.randn(len(symbols)) + 1j * np.random.randn(len(symbols))
+    )
+    return symbols + noise
+
+
+def calculate_ber(tx_bits, rx_bits):
+    """
+    Calculates the Bit Error Rate (BER) and total error count.
+    """
+    length = min(len(tx_bits), len(rx_bits))
+    errors = np.sum(tx_bits[:length] != rx_bits[:length])
+    return errors / length, errors
+
+
+# ==============================================================================
+# 5. THEORETICAL BER FORMULAS
+# ==============================================================================
+
+def theoretical_ber_bpsk(ebn0_db):
+    """Theoretical BER for Coherent BPSK: Pb = Q(sqrt(2*Eb/N0)) = 0.5 * erfc(sqrt(Eb/N0))"""
+    ebn0_lin = 10 ** (ebn0_db / 10)
+    return 0.5 * erfc_vec(np.sqrt(ebn0_lin))
+
+
+def theoretical_ber_qpsk(ebn0_db):
+    """Theoretical BER for Coherent Gray-coded QPSK: Pb = Q(sqrt(2*Eb/N0)) = 0.5 * erfc(sqrt(Eb/N0))"""
+    return theoretical_ber_bpsk(ebn0_db)
+
+
+def theoretical_ber_dbpsk(ebn0_db):
+    """Theoretical BER for Differential BPSK (DBPSK): Pb = 0.5 * exp(-Eb/N0)"""
+    ebn0_lin = 10 ** (ebn0_db / 10)
+    return 0.5 * np.exp(-ebn0_lin)
+
+
+# ==============================================================================
+# 6. MANDATORY QPSK MANUAL VALIDATION
+# ==============================================================================
+
+def manual_qpsk_validation():
+    print("=" * 75)
+    print("MANDATORY VALIDATION — GRAY-CODED QPSK MAPPING & DEMAPPING")
+    print("=" * 75)
+
+    pairs = [[0, 0], [0, 1], [1, 1], [1, 0]]
+    print(f"{'Bit Pair':<12}{'Mapped Symbol (I + jQ)':<28}{'Magnitude':<14}{'Phase (deg)':<12}")
+    print("-" * 75)
+
+    for pair in pairs:
+        bits_in = np.array(pair)
+        sym = qpsk_mapper(bits_in)[0]
+        mag = np.abs(sym)
+        phase = np.rad2deg(np.angle(sym)) % 360
+        print(f"{pair[0]}{pair[1]:<10}{sym.real:+.4f} {sym.imag:+.4f}j{'':<10}{mag:.4f}{'':<6}{phase:6.1f}°")
+
+    print("\nEnd-to-End Detector Verification:")
+    print("-" * 35)
+    print(f"{'Input Bits':<15}{'Detected Bits':<15}{'Status'}")
+    print("-" * 35)
+    for pair in pairs:
+        bits_in = np.array(pair)
+        tx = qpsk_mapper(bits_in)
+        rx = qpsk_demapper(tx)
+        status = "PASSED" if np.array_equal(bits_in, rx) else "FAILED"
+        print(f"{pair[0]}{pair[1]:<13}{rx[0]}{rx[1]:<13}{status}")
+    print("=" * 75 + "\n")
+
+
+manual_qpsk_validation()
+
+
+# ==============================================================================
+# 7. GENERATE DATA & SYMBOLS FOR PLOTS
+# ==============================================================================
+
+data_bits = np.random.randint(0, 2, NUM_BITS)
+if len(data_bits) % 2 != 0:
+    data_bits = data_bits[:-1]
+
+disp_bits = data_bits[:2 * DISPLAY_SYMBOLS]
+
+# Generate base symbols
+tx_bpsk_disp = bpsk_mapper(disp_bits[:DISPLAY_SYMBOLS])
+tx_qpsk_disp = qpsk_mapper(disp_bits)
+tx_dbpsk_disp = dbpsk_mapper(disp_bits[:DISPLAY_SYMBOLS])
+
+
+# ==============================================================================
+# 8. VISUALIZATION 1: IDEAL & NOISY CONSTELLATIONS
+# ==============================================================================
+
+rx_bpsk_noisy = add_awgn(tx_bpsk_disp, SNR_FOR_PLOTS, bits_per_symbol=1)
+rx_qpsk_noisy = add_awgn(tx_qpsk_disp, SNR_FOR_PLOTS, bits_per_symbol=2)
+rx_dbpsk_noisy = add_awgn(tx_dbpsk_disp, SNR_FOR_PLOTS, bits_per_symbol=1)
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+# Ideal BPSK
+axes[0, 0].scatter(tx_bpsk_disp.real, tx_bpsk_disp.imag, color='blue', s=60, marker='o')
+axes[0, 0].set_title("Ideal BPSK Constellation", fontsize=12, fontweight='bold')
+
+# Ideal QPSK
+axes[0, 1].scatter(tx_qpsk_disp.real, tx_qpsk_disp.imag, color='red', s=60, marker='s')
+axes[0, 1].set_title("Ideal QPSK Constellation", fontsize=12, fontweight='bold')
+
+# Ideal DBPSK
+axes[0, 2].scatter(tx_dbpsk_disp.real, tx_dbpsk_disp.imag, color='green', s=60, marker='^')
+axes[0, 2].set_title("Ideal DBPSK Constellation", fontsize=12, fontweight='bold')
+
+# Noisy BPSK
+axes[1, 0].scatter(rx_bpsk_noisy.real, rx_bpsk_noisy.imag, color='blue', s=10, alpha=0.5)
+axes[1, 0].set_title(f"Noisy BPSK (Eb/N0 = {SNR_FOR_PLOTS} dB)", fontsize=12, fontweight='bold')
+
+# Noisy QPSK
+axes[1, 1].scatter(rx_qpsk_noisy.real, rx_qpsk_noisy.imag, color='red', s=10, alpha=0.5)
+axes[1, 1].set_title(f"Noisy QPSK (Eb/N0 = {SNR_FOR_PLOTS} dB)", fontsize=12, fontweight='bold')
+
+# Noisy DBPSK
+axes[1, 2].scatter(rx_dbpsk_noisy.real, rx_dbpsk_noisy.imag, color='green', s=10, alpha=0.5)
+axes[1, 2].set_title(f"Noisy DBPSK (Eb/N0 = {SNR_FOR_PLOTS} dB)", fontsize=12, fontweight='bold')
+
+for ax in axes.flat:
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.axvline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.set_xlabel("In-Phase (I)", fontsize=10)
+    ax.set_ylabel("Quadrature (Q)", fontsize=10)
+    ax.set_xlim(-2.0, 2.0)
+    ax.set_ylim(-2.0, 2.0)
+    ax.set_aspect('equal')
+    ax.grid(True, linestyle=':', alpha=0.6)
+
+plt.suptitle("Required Visualization 1: Ideal vs Noisy Constellations", fontsize=15, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 9. VISUALIZATION 2: QPSK MAPPING DIAGRAM
+# ==============================================================================
+
+qpsk_val_bits = np.array([0, 0, 0, 1, 1, 1, 1, 0])
+qpsk_val_symbols = qpsk_mapper(qpsk_val_bits)
+labels = ["00 (45°)", "01 (135°)", "11 (225°)", "10 (315°)"]
+
+plt.figure(figsize=(8, 8))
+theta = np.linspace(0, 2 * np.pi, 200)
+plt.plot(np.cos(theta), np.sin(theta), 'k--', linewidth=1.2, label='Unit Energy Circle (|s|=1)')
+
+plt.scatter(qpsk_val_symbols.real, qpsk_val_symbols.imag, s=200, color='crimson', zorder=5, edgecolors='black', linewidth=1.5)
+
+# Decision boundaries and annotations
+plt.axhline(0, color='navy', linestyle='-', linewidth=1.5, label='Decision Boundary (Q = 0)')
+plt.axvline(0, color='navy', linestyle='-', linewidth=1.5, label='Decision Boundary (I = 0)')
+
+for i, txt in enumerate(labels):
+    pos_x = qpsk_val_symbols.real[i]
+    pos_y = qpsk_val_symbols.imag[i]
+    offset_x = 0.12 if pos_x > 0 else -0.32
+    offset_y = 0.08 if pos_y > 0 else -0.12
+    plt.annotate(
+        f"Bits: {txt}\n({pos_x:+.3f}, {pos_y:+.3f})",
+        (pos_x, pos_y),
+        xytext=(pos_x + offset_x, pos_y + offset_y),
+        fontsize=11,
+        fontweight='bold',
+        bbox=dict(boxstyle="round,pad=0.3", fc="lemonchiffon", ec="goldenrod", alpha=0.8),
+        arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.1", color="black")
+    )
+
+plt.xlim(-1.6, 1.6)
+plt.ylim(-1.6, 1.6)
+plt.xlabel("In-Phase Component (I)", fontsize=12, fontweight='bold')
+plt.ylabel("Quadrature Component (Q)", fontsize=12, fontweight='bold')
+plt.title("Required Visualization 2: Gray-Coded QPSK Constellation & Mapping", fontsize=14, fontweight='bold')
+plt.grid(True, linestyle=':', alpha=0.6)
+plt.legend(loc='upper right', fontsize=10)
+plt.axis('equal')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 10. VISUALIZATION 3: PHASE TRAJECTORY & I/Q TRANSITIONS (BPSK, QPSK, DPSK)
+# ==============================================================================
+
+traj_bits = data_bits[:30]  # 30 bits for clear trajectory visualization
+
+# --- 1. BPSK Trajectory ---
+bpsk_traj_syms = bpsk_mapper(traj_bits)
+bpsk_phases_deg = np.mod(np.rad2deg(np.angle(bpsk_traj_syms)), 360)
+
+# --- 2. QPSK Trajectory ---
+qpsk_traj_syms = qpsk_mapper(traj_bits)
+qpsk_phases_deg = np.mod(np.rad2deg(np.angle(qpsk_traj_syms)), 360)
+
+# --- 3. DBPSK Trajectory ---
+dbpsk_traj_syms = dbpsk_mapper(traj_bits)  # Includes reference symbol at index 0
+dbpsk_phases_deg = np.mod(np.rad2deg(np.angle(dbpsk_traj_syms)), 360)
+# Differential phase changes (Delta theta)
+dbpsk_delta_phase = np.mod(np.diff(dbpsk_phases_deg), 360)
+
+fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+
+# ==================== BPSK ====================
+# BPSK Phase vs Symbol Index
+axes[0, 0].step(np.arange(len(bpsk_phases_deg)), bpsk_phases_deg, where='mid', color='blue', linewidth=2, marker='o')
+axes[0, 0].set_title("BPSK Phase Trajectory", fontsize=12, fontweight='bold')
+axes[0, 0].set_xlabel("Symbol Index", fontsize=10)
+axes[0, 0].set_ylabel("Phase (degrees)", fontsize=10)
+axes[0, 0].set_yticks([0, 180])
+axes[0, 0].set_yticklabels(['0° (bit 0)', '180° (bit 1)'])
+axes[0, 0].set_ylim(-20, 200)
+axes[0, 0].grid(True, linestyle=':', alpha=0.7)
+
+# BPSK I-Q Transition Diagram
+axes[0, 1].plot(bpsk_traj_syms.real, bpsk_traj_syms.imag, 'b-', alpha=0.5, linewidth=1.5)
+axes[0, 1].scatter(bpsk_traj_syms.real, bpsk_traj_syms.imag, color='blue', s=80, zorder=5)
+axes[0, 1].axhline(0, color='gray', linestyle='--')
+axes[0, 1].axvline(0, color='gray', linestyle='--')
+axes[0, 1].set_title("BPSK I-Q State Transitions", fontsize=12, fontweight='bold')
+axes[0, 1].set_xlabel("In-Phase (I)", fontsize=10)
+axes[0, 1].set_ylabel("Quadrature (Q)", fontsize=10)
+axes[0, 1].set_xlim(-1.5, 1.5)
+axes[0, 1].set_ylim(-0.5, 0.5)
+axes[0, 1].grid(True, linestyle=':', alpha=0.7)
+
+# ==================== QPSK ====================
+# QPSK Phase vs Symbol Index
+axes[1, 0].step(np.arange(len(qpsk_phases_deg)), qpsk_phases_deg, where='mid', color='purple', linewidth=2, marker='s')
+axes[1, 0].set_title("QPSK Phase Trajectory", fontsize=12, fontweight='bold')
+axes[1, 0].set_xlabel("Symbol Index (2 bits/symbol)", fontsize=10)
+axes[1, 0].set_ylabel("Phase (degrees)", fontsize=10)
+axes[1, 0].set_yticks([45, 135, 225, 315])
+axes[1, 0].set_yticklabels(['45° (00)', '135° (01)', '225° (11)', '315° (10)'])
+axes[1, 0].set_ylim(20, 340)
+axes[1, 0].grid(True, linestyle=':', alpha=0.7)
+
+# QPSK I-Q Transition Diagram
+axes[1, 1].plot(qpsk_traj_syms.real, qpsk_traj_syms.imag, 'm-', alpha=0.5, linewidth=1.5)
+axes[1, 1].scatter(qpsk_traj_syms.real, qpsk_traj_syms.imag, color='purple', s=80, marker='s', zorder=5)
+axes[1, 1].axhline(0, color='gray', linestyle='--')
+axes[1, 1].axvline(0, color='gray', linestyle='--')
+axes[1, 1].set_title("QPSK I-Q State Transitions", fontsize=12, fontweight='bold')
+axes[1, 1].set_xlabel("In-Phase (I)", fontsize=10)
+axes[1, 1].set_ylabel("Quadrature (Q)", fontsize=10)
+axes[1, 1].set_xlim(-1.2, 1.2)
+axes[1, 1].set_ylim(-1.2, 1.2)
+axes[1, 1].grid(True, linestyle=':', alpha=0.7)
+
+# ==================== DBPSK (DPSK) ====================
+# DBPSK Phase Trajectory (Transmitted Phase & Delta Phase)
+axes[2, 0].step(np.arange(len(dbpsk_phases_deg)), dbpsk_phases_deg, where='mid', color='green', linewidth=2, marker='^', label='Carrier Phase θ[k]')
+axes[2, 0].step(np.arange(1, len(dbpsk_phases_deg)), dbpsk_delta_phase, where='mid', color='darkorange', linewidth=2, linestyle='--', marker='x', label='Phase Shift Δθ[k] = θ[k]-θ[k-1]')
+axes[2, 0].set_title("DBPSK (DPSK) Phase & Differential Shift Trajectory", fontsize=12, fontweight='bold')
+axes[2, 0].set_xlabel("Symbol Index (including ref symbol s[0])", fontsize=10)
+axes[2, 0].set_ylabel("Phase (degrees)", fontsize=10)
+axes[2, 0].set_yticks([0, 180])
+axes[2, 0].set_yticklabels(['0° (Δθ=0°: bit 0)', '180° (Δθ=180°: bit 1)'])
+axes[2, 0].set_ylim(-30, 210)
+axes[2, 0].legend(loc='upper right', fontsize=9)
+axes[2, 0].grid(True, linestyle=':', alpha=0.7)
+
+# DBPSK I-Q Transition Diagram
+axes[2, 1].plot(dbpsk_traj_syms.real, dbpsk_traj_syms.imag, 'g-', alpha=0.5, linewidth=1.5)
+axes[2, 1].scatter(dbpsk_traj_syms.real, dbpsk_traj_syms.imag, color='green', s=80, marker='^', zorder=5)
+axes[2, 1].axhline(0, color='gray', linestyle='--')
+axes[2, 1].axvline(0, color='gray', linestyle='--')
+axes[2, 1].set_title("DBPSK (DPSK) I-Q State Transitions", fontsize=12, fontweight='bold')
+axes[2, 1].set_xlabel("In-Phase (I)", fontsize=10)
+axes[2, 1].set_ylabel("Quadrature (Q)", fontsize=10)
+axes[2, 1].set_xlim(-1.5, 1.5)
+axes[2, 1].set_ylim(-0.5, 0.5)
+axes[2, 1].grid(True, linestyle=':', alpha=0.7)
+
+plt.suptitle("Required Visualization 3: Phase Trajectories & State Transitions for BPSK, QPSK, and DPSK", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 11. VISUALIZATION 4: CARRIER PHASE OFFSET CONSTELLATIONS
+# ==============================================================================
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+test_offsets = [10, 30, 60, 90]
+
+for idx, offset in enumerate(test_offsets):
+    ax = axes.flat[idx]
+    rotated_qpsk = apply_phase_offset(tx_qpsk_disp, offset)
+    noisy_rot = add_awgn(rotated_qpsk, SNR_FOR_PLOTS, bits_per_symbol=2)
+
+    ax.scatter(noisy_rot.real, noisy_rot.imag, s=12, alpha=0.4, color='teal')
+    ax.axhline(0, color='red', linestyle='--', linewidth=1.2, label='Decision Boundary')
+    ax.axvline(0, color='red', linestyle='--', linewidth=1.2)
+    ax.set_title(f"QPSK Constellation with {offset}° Phase Offset", fontsize=12, fontweight='bold')
+    ax.set_xlabel("In-Phase (I)", fontsize=10)
+    ax.set_ylabel("Quadrature (Q)", fontsize=10)
+    ax.set_xlim(-2.0, 2.0)
+    ax.set_ylim(-2.0, 2.0)
+    ax.set_aspect('equal')
+    ax.grid(True, linestyle=':', alpha=0.6)
+
+plt.suptitle(f"QPSK Constellation Rotation Under Carrier Phase Error (Eb/N0 = {SNR_FOR_PLOTS} dB)", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 12. FULL BER SIMULATION
+# ==============================================================================
+
+print("=" * 75)
+print("RUNNING MONTE CARLO BER SIMULATION...")
+print("=" * 75)
+
+BER_BPSK = {p: [] for p in PHASE_OFFSETS}
+BER_QPSK = {p: [] for p in PHASE_OFFSETS}
+BER_DBPSK = {p: [] for p in PHASE_OFFSETS}
+
+for phase in PHASE_OFFSETS:
+    print(f"-> Simulating for Carrier Phase Offset = {phase}° ...")
+    for ebn0 in EBN0_DB:
+        # --- BPSK ---
+        tx_b = bpsk_mapper(data_bits)
+        tx_b_rot = apply_phase_offset(tx_b, phase)
+        rx_b = add_awgn(tx_b_rot, ebn0, bits_per_symbol=1)
+        det_b = bpsk_demapper(rx_b)
+        ber_b, _ = calculate_ber(data_bits, det_b)
+        BER_BPSK[phase].append(ber_b)
+
+        # --- QPSK ---
+        tx_q = qpsk_mapper(data_bits)
+        tx_q_rot = apply_phase_offset(tx_q, phase)
+        rx_q = add_awgn(tx_q_rot, ebn0, bits_per_symbol=2)
+        det_q = qpsk_demapper(rx_q)
+        ber_q, _ = calculate_ber(data_bits, det_q)
+        BER_QPSK[phase].append(ber_q)
+
+        # --- DBPSK ---
+        tx_db = dbpsk_mapper(data_bits)
+        tx_db_rot = apply_phase_offset(tx_db, phase)
+        rx_db = add_awgn(tx_db_rot, ebn0, bits_per_symbol=1)
+        det_db, _ = dbpsk_demapper(rx_db)
+        ber_db, _ = calculate_ber(data_bits, det_db)
+        BER_DBPSK[phase].append(ber_db)
+
+print("Simulation finished successfully.\n")
+
+
+# ==============================================================================
+# 13. VISUALIZATION 5: BER COMPARISON (SIMULATED VS THEORETICAL)
+# ==============================================================================
+
+plt.figure(figsize=(10, 7))
+
+# Theoretical Curves
+plt.semilogy(EBN0_DB_FINE, theoretical_ber_bpsk(EBN0_DB_FINE), 'k-', linewidth=2, label='Theoretical BPSK / QPSK: Q(√(2Eb/N0))')
+plt.semilogy(EBN0_DB_FINE, theoretical_ber_dbpsk(EBN0_DB_FINE), 'k--', linewidth=2, label='Theoretical DBPSK: 0.5·exp(-Eb/N0)')
+
+# Simulated Curves (0° Phase Offset)
+plt.semilogy(EBN0_DB, BER_BPSK[0], 'bo', markersize=8, label='Simulated BPSK (0° Phase Offset)')
+plt.semilogy(EBN0_DB, BER_QPSK[0], 'rs', markersize=8, label='Simulated QPSK (0° Phase Offset)')
+plt.semilogy(EBN0_DB, BER_DBPSK[0], 'g^', markersize=8, label='Simulated DBPSK (0° Phase Offset)')
+
+plt.xlabel("Eb/N0 (dB)", fontsize=12, fontweight='bold')
+plt.ylabel("Bit Error Rate (BER)", fontsize=12, fontweight='bold')
+plt.title("Required Visualization 4: BER Comparison — Simulated vs Theoretical", fontsize=14, fontweight='bold')
+plt.grid(True, which="both", linestyle=':', alpha=0.7)
+plt.ylim(1e-6, 1)
+plt.xlim(0, 12)
+plt.legend(fontsize=10, loc='lower left')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 14. VISUALIZATION 6: BER UNDER PHASE OFFSETS & DBPSK PHASE IMMUNITY
+# ==============================================================================
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Subplot 1: BER vs Eb/N0 for different phase offsets
+for p in [0, 10, 30, 60]:
+    ax1.semilogy(EBN0_DB, BER_BPSK[p], 'o--', label=f'BPSK ({p}°)')
+    ax1.semilogy(EBN0_DB, BER_QPSK[p], 's:', label=f'QPSK ({p}°)')
+    ax1.semilogy(EBN0_DB, BER_DBPSK[p], '^-', label=f'DBPSK ({p}°)')
+
+ax1.set_xlabel("Eb/N0 (dB)", fontsize=11, fontweight='bold')
+ax1.set_ylabel("Bit Error Rate (BER)", fontsize=11, fontweight='bold')
+ax1.set_title("BER Curves Under Multiple Phase Offsets", fontsize=12, fontweight='bold')
+ax1.grid(True, which="both", linestyle=':', alpha=0.7)
+ax1.set_ylim(1e-6, 1)
+ax1.legend(fontsize=8, ncol=2)
+
+# Subplot 2: BER vs Phase Offset at fixed Eb/N0 = 8 dB
+target_ebn0 = 8
+idx_target = np.where(EBN0_DB == target_ebn0)[0][0]
+
+bpsk_vs_phase = [BER_BPSK[p][idx_target] for p in PHASE_OFFSETS]
+qpsk_vs_phase = [BER_QPSK[p][idx_target] for p in PHASE_OFFSETS]
+dbpsk_vs_phase = [BER_DBPSK[p][idx_target] for p in PHASE_OFFSETS]
+
+ax2.semilogy(PHASE_OFFSETS, bpsk_vs_phase, 'bo-', linewidth=2, markersize=8, label='BPSK (Coherent)')
+ax2.semilogy(PHASE_OFFSETS, qpsk_vs_phase, 'rs-', linewidth=2, markersize=8, label='QPSK (Coherent)')
+ax2.semilogy(PHASE_OFFSETS, dbpsk_vs_phase, 'g^-', linewidth=2, markersize=8, label='DBPSK (Differential)')
+
+ax2.set_xlabel("Carrier Phase Offset (degrees)", fontsize=11, fontweight='bold')
+ax2.set_ylabel("Bit Error Rate (BER)", fontsize=11, fontweight='bold')
+ax2.set_title(f"Carrier Phase Sensitivity at Eb/N0 = {target_ebn0} dB", fontsize=12, fontweight='bold')
+ax2.grid(True, which="both", linestyle=':', alpha=0.7)
+ax2.legend(fontsize=10)
+
+plt.suptitle("BER Performance Degradation & Differential Phase Immunity", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 15. VISUALIZATION 7: DETECTOR DECISION STATISTICS
+# ==============================================================================
+
+stat_bits = data_bits[:30000]
+stat_phase = 30
+stat_ebn0 = 6
+
+# BPSK
+rx_b_stat = add_awgn(apply_phase_offset(bpsk_mapper(stat_bits), stat_phase), stat_ebn0, 1)
+bpsk_stat = rx_b_stat.real
+
+# QPSK
+rx_q_stat = add_awgn(apply_phase_offset(qpsk_mapper(stat_bits), stat_phase), stat_ebn0, 2)
+qpsk_stat_I = rx_q_stat.real
+qpsk_stat_Q = rx_q_stat.imag
+
+# DBPSK
+rx_db_stat = add_awgn(apply_phase_offset(dbpsk_mapper(stat_bits), stat_phase), stat_ebn0, 1)
+_, dbpsk_stat = dbpsk_demapper(rx_db_stat)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+axes[0, 0].hist(bpsk_stat, bins=80, color='dodgerblue', edgecolor='black', alpha=0.7)
+axes[0, 0].axvline(0, color='red', linestyle='--', linewidth=2, label='Threshold = 0')
+axes[0, 0].set_title(f"BPSK Decision Metric: Re{{r}} ({stat_phase}° Offset)", fontsize=11, fontweight='bold')
+axes[0, 0].set_xlabel("Decision Variable", fontsize=10)
+axes[0, 0].set_ylabel("Count", fontsize=10)
+axes[0, 0].grid(True, linestyle=':')
+axes[0, 0].legend()
+
+axes[0, 1].hist(qpsk_stat_I, bins=80, color='salmon', edgecolor='black', alpha=0.7)
+axes[0, 1].axvline(0, color='red', linestyle='--', linewidth=2, label='Threshold = 0')
+axes[0, 1].set_title(f"QPSK In-Phase (I) Decision Metric ({stat_phase}° Offset)", fontsize=11, fontweight='bold')
+axes[0, 1].set_xlabel("Decision Variable", fontsize=10)
+axes[0, 1].set_ylabel("Count", fontsize=10)
+axes[0, 1].grid(True, linestyle=':')
+axes[0, 1].legend()
+
+axes[1, 0].hist(qpsk_stat_Q, bins=80, color='sandybrown', edgecolor='black', alpha=0.7)
+axes[1, 0].axvline(0, color='red', linestyle='--', linewidth=2, label='Threshold = 0')
+axes[1, 0].set_title(f"QPSK Quadrature (Q) Decision Metric ({stat_phase}° Offset)", fontsize=11, fontweight='bold')
+axes[1, 0].set_xlabel("Decision Variable", fontsize=10)
+axes[1, 0].set_ylabel("Count", fontsize=10)
+axes[1, 0].grid(True, linestyle=':')
+axes[1, 0].legend()
+
+axes[1, 1].hist(dbpsk_stat, bins=80, color='mediumseagreen', edgecolor='black', alpha=0.7)
+axes[1, 1].axvline(0, color='red', linestyle='--', linewidth=2, label='Threshold = 0')
+axes[1, 1].set_title(f"DBPSK Metric: Re{{r[k]·r*[k-1]}} ({stat_phase}° Offset)", fontsize=11, fontweight='bold')
+axes[1, 1].set_xlabel("Differential Decision Variable", fontsize=10)
+axes[1, 1].set_ylabel("Count", fontsize=10)
+axes[1, 1].grid(True, linestyle=':')
+axes[1, 1].legend()
+
+plt.suptitle(f"Detector Decision Statistics at Eb/N0 = {stat_ebn0} dB (Phase Offset = {stat_phase}°)", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 16. NUMERICAL BER SUMMARY TABLE & CONCLUSION
+# ==============================================================================
+
+print("\n" + "=" * 85)
+print(f"{'Carrier Phase':<18}{'BPSK BER (8 dB)':<22}{'QPSK BER (8 dB)':<22}{'DBPSK BER (8 dB)':<22}")
+print("=" * 85)
+for p in PHASE_OFFSETS:
+    print(f"{str(p) + '°':<18}{BER_BPSK[p][idx_target]:<22.6f}{BER_QPSK[p][idx_target]:<22.6f}{BER_DBPSK[p][idx_target]:<22.6f}")
+print("=" * 85)
+
+print("""
+KEY SCIENTIFIC CONCLUSIONS:
+1. Ideal AWGN:
+   • BPSK and Gray-coded QPSK achieve identical Bit Error Rate (BER) curves when plotted
+     against Eb/N0, because QPSK independently detects two orthogonal BPSK channels in I and Q.
+   • DBPSK has a ~0.8 dB SNR penalty compared to coherent BPSK due to noise correlation
+     between consecutive symbols r[k] and r[k-1].
+
+2. Phase Ambiguity & Carrier Offset:
+   • Coherent BPSK and QPSK require precise carrier synchronization. As carrier phase error
+     increases towards 90°, coherent receivers cross decision thresholds and experience severe failure.
+   • DBPSK is immune to constant carrier phase rotation because r[k]·r*[k-1] cancels exp(j·phi),
+     making it robust in non-coherent or fading channels without carrier recovery.
+""")
